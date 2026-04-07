@@ -93,13 +93,6 @@ flexql_close(db);
 
 ---
 
-## Performance
-
-| Scale | Elapsed | Throughput |
-|-------|---------|------------|
-| 100K rows INSERT | ~0.32 s | ~312K rows/sec |
-| 1M rows INSERT | ~3.2 s | ~312K rows/sec |
-| SELECT by PK | < 1 ms | indexed lookup |
 
 Achieved by:
 - **No page buffer pool** — rows append directly to binary files
