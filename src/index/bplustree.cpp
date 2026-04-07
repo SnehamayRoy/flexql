@@ -77,13 +77,15 @@ bool BPlusTree::contains(const std::string &key) const {
     return find(key).has_value();
 }
 
-std::optional<BPlusTree::SplitResult> BPlusTree::insert_recursive(Node *node, const std::string &key, size_t value) {
+std::optional<BPlusTree::SplitResult> BPlusTree::insert_recursive(
+    Node *node, const std::string &key, size_t value, bool &inserted) {
     if (node->is_leaf) {
         size_t pos = 0;
         while (pos < node->keys.size() && compare_keys(node->keys[pos], key) < 0) {
             ++pos;
         }
         if (pos < node->keys.size() && compare_keys(node->keys[pos], key) == 0) {
+            inserted = false;
             return std::nullopt;
         }
 
@@ -106,7 +108,7 @@ std::optional<BPlusTree::SplitResult> BPlusTree::insert_recursive(Node *node, co
 
         right->next = node->next;
         node->next = right.get();
-        return SplitResult{right->keys.front(), std::move(right)};
+        return SplitResult{right->keys.front(), std::move(right), true};
     }
 
     size_t child_index = 0;
@@ -114,8 +116,8 @@ std::optional<BPlusTree::SplitResult> BPlusTree::insert_recursive(Node *node, co
         ++child_index;
     }
 
-    auto child_split = insert_recursive(node->children[child_index].get(), key, value);
-    if (!child_split.has_value()) {
+    auto child_split = insert_recursive(node->children[child_index].get(), key, value, inserted);
+    if (!inserted || !child_split.has_value()) {
         return std::nullopt;
     }
 
@@ -150,15 +152,15 @@ std::optional<BPlusTree::SplitResult> BPlusTree::insert_recursive(Node *node, co
         node->children.begin() + static_cast<std::ptrdiff_t>(mid + 1),
         node->children.end());
 
-    return SplitResult{promoted, std::move(right)};
+    return SplitResult{promoted, std::move(right), true};
 }
 
 bool BPlusTree::insert(const std::string &key, size_t value) {
-    if (contains(key)) {
+    bool inserted = true;
+    auto split = insert_recursive(root_.get(), key, value, inserted);
+    if (!inserted) {
         return false;
     }
-
-    auto split = insert_recursive(root_.get(), key, value);
     if (!split.has_value()) {
         return true;
     }

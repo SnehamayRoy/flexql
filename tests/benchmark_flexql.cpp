@@ -8,8 +8,8 @@
 using namespace std;
 using namespace std::chrono;
 
-static const long long DEFAULT_INSERT_ROWS = 10LL; // 100k rows by default for insertion benchmark
-static const int INSERT_BATCH_SIZE = 50000; // tuned for local benchmarking against the FlexQL batch insert path
+static const long long DEFAULT_INSERT_ROWS = 100000LL; // 100k rows by default for insertion benchmark
+static const int INSERT_BATCH_SIZE = 20000; // tuned for local benchmarking against the FlexQL batch insert path
 
 struct QueryStats {
     long long rows = 0;

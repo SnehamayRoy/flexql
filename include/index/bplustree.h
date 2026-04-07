@@ -36,6 +36,7 @@ private:
     struct SplitResult {
         std::string promoted_key;
         std::unique_ptr<Node> right_node;
+        bool inserted = true;
     };
 
     size_t order_;
@@ -45,7 +46,7 @@ private:
     int compare_keys(const std::string &left, const std::string &right) const;
     const Node *find_leaf(const std::string &key) const;
     Node *find_leaf(const std::string &key);
-    std::optional<SplitResult> insert_recursive(Node *node, const std::string &key, size_t value);
+    std::optional<SplitResult> insert_recursive(Node *node, const std::string &key, size_t value, bool &inserted);
 };
 
 #endif

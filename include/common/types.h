@@ -60,8 +60,8 @@ struct Table {
     std::string name;
     std::vector<Column> columns;
     std::unordered_map<std::string, size_t>  column_index;
-    std::vector<Row> rows;
-
+    uint32_t next_page_id = 1;
+    uint32_t next_slot_id = 0;
     // Primary index on the first column.
     std::unique_ptr<BPlusTree> primary_index;
 

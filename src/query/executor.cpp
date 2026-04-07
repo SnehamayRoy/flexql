@@ -6,10 +6,47 @@
 #include <cctype>
 #include <unordered_map>
 #include <unordered_set>
+#include <cstring>
 #include <optional>
 #include <string_view>
 
 namespace {
+
+bool starts_with_ci(std::string_view text, std::string_view prefix) {
+    if (text.size() < prefix.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < prefix.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(text[i])) !=
+            std::tolower(static_cast<unsigned char>(prefix[i]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+size_t find_ci(std::string_view haystack, std::string_view needle) {
+    if (needle.empty()) {
+        return 0;
+    }
+    if (haystack.size() < needle.size()) {
+        return std::string::npos;
+    }
+    for (size_t i = 0; i + needle.size() <= haystack.size(); ++i) {
+        bool match = true;
+        for (size_t j = 0; j < needle.size(); ++j) {
+            if (std::tolower(static_cast<unsigned char>(haystack[i + j])) !=
+                std::tolower(static_cast<unsigned char>(needle[j]))) {
+                match = false;
+                break;
+            }
+        }
+        if (match) {
+            return i;
+        }
+    }
+    return std::string::npos;
+}
 
 std::optional<Row::Value> resolve_operand(
     const Operand &operand,
@@ -292,11 +329,30 @@ bool fast_parse_insert_rows(const std::string &sql,
                 if (col < ncols) {
                     ColumnType ct = table.columns[col].type;
                     if (ct == ColumnType::Decimal) {
-                        try { row.values.emplace_back(std::stod(std::string(tok))); }
-                        catch (...) { row.values.emplace_back(std::string(tok)); }
+                        char tbuf[64];
+                        size_t len = std::min<size_t>(tok.size(), 63);
+                        memcpy(tbuf, tok.data(), len);
+                        tbuf[len] = '\0';
+                        char* end;
+                        double val = std::strtod(tbuf, &end);
+                        if (end == tbuf) {
+                            row.values.emplace_back(std::string(tok));
+                        } else {
+                            row.values.emplace_back(val);
+                        }
                     } else if (ct == ColumnType::Int || ct == ColumnType::DateTime) {
-                        try { row.values.emplace_back(std::stoll(std::string(tok))); }
-                        catch (...) { row.values.emplace_back(std::string(tok)); }
+                        int64_t val = 0;
+                        int sign = 1;
+                        size_t i = 0;
+                        if (tok.size() > 0 && tok[0] == '-') { sign = -1; i++; }
+                        for (; i < tok.size(); ++i) {
+                            if (tok[i] >= '0' && tok[i] <= '9') {
+                                val = val * 10 + (tok[i] - '0');
+                            } else {
+                                break; 
+                            }
+                        }
+                        row.values.emplace_back(val * sign);
                     } else {
                         row.values.emplace_back(std::string(tok));
                     }
@@ -374,10 +430,9 @@ ExecResult execute_insert(Database &database, const std::string &sql) {
     std::string error;
 
     std::string clean_sql = trim(sql);
-    std::string upper_sql = to_upper(clean_sql);
     const std::string prefix = "INSERT INTO ";
-    size_t values_pos = upper_sql.find(" VALUES ");
-    if (upper_sql.rfind(prefix, 0) != 0 || values_pos == std::string::npos) {
+    size_t values_pos = find_ci(clean_sql, " VALUES ");
+    if (!starts_with_ci(clean_sql, prefix) || values_pos == std::string::npos) {
         result.error = "invalid INSERT syntax";
         return result;
     }
@@ -419,22 +474,22 @@ ExecResult execute_insert(Database &database, const std::string &sql) {
     // Pre-compute primary keys before acquiring the lock
     std::vector<std::string> pk_strings;
     pk_strings.reserve(new_rows.size());
+    std::unordered_set<std::string> batch_keys;
+    batch_keys.reserve(new_rows.size());
     for (const auto &row : new_rows) {
         if (row.values.size() != table->columns.size()) {
             result.error = "column count mismatch for table: " + table_name;
             return result;
         }
-        pk_strings.push_back(value_to_string(row.values[0]));
+        std::string pk = value_to_string(row.values[0]);
+        if (!batch_keys.insert(pk).second) {
+            result.error = "duplicate primary key in batch: " + pk;
+            return result;
+        }
+        pk_strings.push_back(std::move(pk));
     }
 
     std::unique_lock<std::shared_mutex> lock(table->mutex);
-
-    // Ensure rows vector has capacity (pre-allocate for 10M rows on first insert)
-    if (table->rows.empty()) {
-        table->rows.reserve(10'000'000);
-    } else if (table->rows.capacity() < table->rows.size() + new_rows.size()) {
-        table->rows.reserve((table->rows.size() + new_rows.size()) * 2);
-    }
 
     // Validate PK uniqueness
     for (const auto &pk : pk_strings) {
@@ -444,17 +499,12 @@ ExecResult execute_insert(Database &database, const std::string &sql) {
         }
     }
 
-    // Persist to disk (under lock — maintains insert order on disk)
-    if (!persist_rows(database, *table, new_rows, error)) {
+    // Persist to disk and insert into primary index
+    if (!persist_rows_batch(database, *table, new_rows, pk_strings, error)) {
         result.error = error;
         return result;
     }
 
-    // Insert into memory and update hash index
-    for (size_t i = 0; i < new_rows.size(); ++i) {
-        table->primary_index->insert(pk_strings[i], table->rows.size());
-        table->rows.push_back(std::move(new_rows[i]));
-    }
     ++table->version;
     result.ok = true;
     return result;
@@ -567,7 +617,8 @@ ExecResult execute_select(Database &database, const std::string &sql) {
             }
 
             for (size_t row_index : row_indexes) {
-                const Row &row = left_table->rows[row_index];
+                Row row;
+                if (!fetch_row_by_id(database, *left_table, row_index, row)) continue;
                 if (!query.where_condition.has_value() ||
                     evaluate_condition(query.where_condition.value(), *left_table, row, nullptr, nullptr)) {
                     if (!fill_projection(row, nullptr)) {
@@ -581,69 +632,84 @@ ExecResult execute_select(Database &database, const std::string &sql) {
 
         // Sequential scan for non-indexed WHERE
         if (!used_index) {
-            for (const auto &row : left_table->rows) {
+            bool has_error = false;
+            scan_table(database, *left_table, [&](const Row& row) {
+                if (has_error) return;
                 if (query.where_condition.has_value() &&
                     !evaluate_condition(query.where_condition.value(), *left_table, row, nullptr, nullptr)) {
-                    continue;
+                    return;
                 }
                 if (!fill_projection(row, nullptr)) {
                     result.error = "unknown column in SELECT";
-                    return result;
+                    has_error = true;
                 }
-            }
+            });
+            if (has_error) return result;
         }
     } else {
         auto join_access = extract_hash_join_access(query.join_condition.value(), *left_table, *right_table);
         if (join_access.has_value()) {
-            std::unordered_map<std::string, std::vector<const Row *>> right_rows_by_key;
-            right_rows_by_key.reserve(right_table->rows.size());
+            bool join_error = false;
+            std::unordered_map<std::string, std::vector<Row>> right_rows_by_key;
 
-            for (const auto &right_row : right_table->rows) {
+            scan_table(database, *right_table, [&](const Row& right_row) {
+                if (join_error) return;
                 auto right_key = resolve_table_operand(*join_access->right_operand, *right_table, right_row);
                 if (!right_key.has_value()) {
                     result.error = "unknown column in JOIN";
-                    return result;
+                    join_error = true;
+                    return;
                 }
-                right_rows_by_key[value_to_string(right_key.value())].push_back(&right_row);
-            }
+                right_rows_by_key[value_to_string(right_key.value())].push_back(right_row);
+            });
+            if (join_error) return result;
 
-            for (const auto &left_row : left_table->rows) {
+            scan_table(database, *left_table, [&](const Row& left_row) {
+                if (join_error) return;
                 auto left_key = resolve_table_operand(*join_access->left_operand, *left_table, left_row);
                 if (!left_key.has_value()) {
                     result.error = "unknown column in JOIN";
-                    return result;
+                    join_error = true;
+                    return;
                 }
                 auto matches = right_rows_by_key.find(value_to_string(left_key.value()));
                 if (matches == right_rows_by_key.end()) {
-                    continue;
+                    return;
                 }
-                for (const Row *right_row : matches->second) {
-                    if (query.where_condition.has_value() &&
-                        !evaluate_condition(query.where_condition.value(), *left_table, left_row, right_table.get(), right_row)) {
-                        continue;
-                    }
-                    if (!fill_projection(left_row, right_row)) {
-                        result.error = "unknown column in SELECT";
-                        return result;
-                    }
-                }
-            }
-        } else {
-            for (const auto &left_row : left_table->rows) {
-                for (const auto &right_row : right_table->rows) {
-                    if (!evaluate_condition(query.join_condition.value(), *left_table, left_row, right_table.get(), &right_row)) {
-                        continue;
-                    }
+                for (const Row &right_row : matches->second) {
                     if (query.where_condition.has_value() &&
                         !evaluate_condition(query.where_condition.value(), *left_table, left_row, right_table.get(), &right_row)) {
                         continue;
                     }
                     if (!fill_projection(left_row, &right_row)) {
                         result.error = "unknown column in SELECT";
-                        return result;
+                        join_error = true;
+                        return;
                     }
                 }
-            }
+            });
+            if (join_error) return result;
+
+        } else {
+            bool nl_error = false;
+            scan_table(database, *left_table, [&](const Row& left_row) {
+                if (nl_error) return;
+                scan_table(database, *right_table, [&](const Row& right_row) {
+                    if (nl_error) return;
+                    if (!evaluate_condition(query.join_condition.value(), *left_table, left_row, right_table.get(), &right_row)) {
+                        return;
+                    }
+                    if (query.where_condition.has_value() &&
+                        !evaluate_condition(query.where_condition.value(), *left_table, left_row, right_table.get(), &right_row)) {
+                        return;
+                    }
+                    if (!fill_projection(left_row, &right_row)) {
+                        result.error = "unknown column in SELECT";
+                        nl_error = true;
+                    }
+                });
+            });
+            if (nl_error) return result;
         }
     }
 
@@ -666,14 +732,13 @@ ExecResult execute_select(Database &database, const std::string &sql) {
 
 ExecResult execute_sql(Database &database, const std::string &sql) {
     std::string clean_sql = strip_trailing_semicolon(sql);
-    std::string upper = to_upper(clean_sql);
-    if (upper.rfind("CREATE TABLE", 0) == 0) {
+    if (starts_with_ci(clean_sql, "CREATE TABLE")) {
         return execute_create_table(database, clean_sql);
     }
-    if (upper.rfind("INSERT INTO", 0) == 0) {
+    if (starts_with_ci(clean_sql, "INSERT INTO")) {
         return execute_insert(database, clean_sql);
     }
-    if (upper.rfind("SELECT", 0) == 0) {
+    if (starts_with_ci(clean_sql, "SELECT")) {
         return execute_select(database, clean_sql);
     }
 

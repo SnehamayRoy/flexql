@@ -11,6 +11,22 @@
 #include <string>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <csignal>
+#include <atomic>
+
+std::atomic<bool> g_running{true};
+int g_server_fd = -1;
+
+void handle_signal(int sig) {
+    if (sig == SIGINT || sig == SIGTERM) {
+        g_running = false;
+        if (g_server_fd >= 0) {
+            ::shutdown(g_server_fd, SHUT_RDWR);
+            ::close(g_server_fd);
+            g_server_fd = -1;
+        }
+    }
+}
 
 namespace fs = std::filesystem;
 
@@ -141,6 +157,10 @@ int main(int argc, char **argv) {
         std::cerr << "socket() failed" << std::endl;
         return 1;
     }
+    g_server_fd = server_fd;
+
+    std::signal(SIGINT, handle_signal);
+    std::signal(SIGTERM, handle_signal);
 
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -171,11 +191,12 @@ int main(int argc, char **argv) {
     size_t worker_count = std::thread::hardware_concurrency();
     pool.start(worker_count == 0 ? 4 : worker_count);
 
-    while (true) {
+    while (g_running) {
         sockaddr_in client_addr{};
         socklen_t addr_len = sizeof(client_addr);
         int client_socket = ::accept(server_fd, reinterpret_cast<sockaddr *>(&client_addr), &addr_len);
         if (client_socket < 0) {
+            if (!g_running) break;
             continue;
         }
         int nodelay = 1;
@@ -185,8 +206,11 @@ int main(int argc, char **argv) {
         });
     }
 
+    std::cout << "Shutting down..." << std::endl;
     pool.stop();
-    ::close(server_fd);
+    if (server_fd >= 0) {
+        ::close(server_fd);
+    }
 
     // Final fsync on all open table files to ensure durability
     {

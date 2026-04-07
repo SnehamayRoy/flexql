@@ -18,6 +18,7 @@ g++ -std=c++17 -O3 -pthread \
   "$ROOT_DIR/src/cache/query_cache.cpp" \
   "$ROOT_DIR/src/parser/sql_parser.cpp" \
   "$ROOT_DIR/src/storage/storage_engine.cpp" \
+  "$ROOT_DIR/src/storage/buffer_pool.cpp" \
   "$ROOT_DIR/src/query/executor.cpp" \
   "$ROOT_DIR/src/utils/sql_utils.cpp" \
   "$ROOT_DIR/src/index/bplustree.cpp" \
